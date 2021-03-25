@@ -5,3 +5,6 @@ The inputs to this are images in RGB format. The images are converted into their
 <img src="https://i.imgur.com/UYTi1uB.png" width="200" height="300"> ----> <img src="https://i.stack.imgur.com/9PrQc.jpg" width="200" height="300">
 
 Written in Python using Pytorch backend
+
+# References
+[1] https://github.com/kevinlu1211/pytorch-unet-resnet-50-encoder
