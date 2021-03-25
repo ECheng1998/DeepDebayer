@@ -8,3 +8,4 @@ Written in Python using Pytorch backend
 
 # References
 [1] https://github.com/kevinlu1211/pytorch-unet-resnet-50-encoder
+[2] https://github.com/psyrocloud/MS-SSIM_L1_LOSS
