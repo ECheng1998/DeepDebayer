@@ -16,64 +16,89 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import datasets, transforms, models
 from google.colab import files
 
-def rgb2bayer(img):
-    temp = img.numpy()
-    temp = temp.transpose(1,2,0)
+class MS_SSIM_L1_LOSS(nn.Module):
+    # Have to use cuda, otherwise the speed is too slow.
+    def __init__(self, gaussian_sigmas=[0.5, 1.0, 2.0, 4.0, 8.0],
+                 data_range = 1.0,
+                 K=(0.01, 0.03),
+                 alpha=0.025,
+                 compensation=200.0,
+                 cuda_dev=0,):
+        super(MS_SSIM_L1_LOSS, self).__init__()
+        self.DR = data_range
+        self.C1 = (K[0] * data_range) ** 2
+        self.C2 = (K[1] * data_range) ** 2
+        self.pad = int(2 * gaussian_sigmas[-1])
+        self.alpha = alpha
+        self.compensation=compensation
+        filter_size = int(4 * gaussian_sigmas[-1] + 1)
+        g_masks = torch.zeros((3*len(gaussian_sigmas), 1, filter_size, filter_size))
+        for idx, sigma in enumerate(gaussian_sigmas):
+            # r0,g0,b0,r1,g1,b1,...,rM,gM,bM
+            g_masks[3*idx+0, 0, :, :] = self._fspecial_gauss_2d(filter_size, sigma)
+            g_masks[3*idx+1, 0, :, :] = self._fspecial_gauss_2d(filter_size, sigma)
+            g_masks[3*idx+2, 0, :, :] = self._fspecial_gauss_2d(filter_size, sigma)
+        self.g_masks = g_masks.cuda(cuda_dev)
 
-    w,h,c = temp.shape
-    resArray = np.zeros((w, h, 3), dtype=np.float)
-    resArray[::2, ::2, 2] = temp[::2, ::2, 2]
-    resArray[1::2, ::2, 1] = temp[1::2, ::2, 1]
-    resArray[::2, 1::2, 1] = temp[::2, 1::2, 1]
-    resArray[1::2, 1::2, 0] = temp[1::2, 1::2, 0]
-    resArray = resArray.astype('float32')
+    def _fspecial_gauss_1d(self, size, sigma):
+        """Create 1-D gauss kernel
+        Args:
+            size (int): the size of gauss kernel
+            sigma (float): sigma of normal distribution
 
-    temp = torch.from_numpy(resArray)
-    temp = temp.permute(2,0,1)
-    return temp
+        Returns:
+            torch.Tensor: 1D kernel (size)
+        """
+        coords = torch.arange(size).to(dtype=torch.float)
+        coords -= size // 2
+        g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+        g /= g.sum()
+        return g.reshape(-1)
 
-def tensorStack(tenS):
-    temp = []
-    for i in tenS:
-        i = rgb2bayer(i)
-        temp.append(i)
-    temp = torch.stack(temp)
-    return temp
+    def _fspecial_gauss_2d(self, size, sigma):
+        """Create 2-D gauss kernel
+        Args:
+            size (int): the size of gauss kernel
+            sigma (float): sigma of normal distribution
+
+        Returns:
+            torch.Tensor: 2D kernel (size x size)
+        """
+        gaussian_vec = self._fspecial_gauss_1d(size, sigma)
+        return torch.outer(gaussian_vec, gaussian_vec)
+
+    def forward(self, x, y):
+        b, c, h, w = x.shape
+        mux = F.conv2d(x, self.g_masks, groups=3, padding=self.pad)
+        muy = F.conv2d(y, self.g_masks, groups=3, padding=self.pad)
+
+        mux2 = mux * mux
+        muy2 = muy * muy
+        muxy = mux * muy
+
+        sigmax2 = F.conv2d(x * x, self.g_masks, groups=3, padding=self.pad) - mux2
+        sigmay2 = F.conv2d(y * y, self.g_masks, groups=3, padding=self.pad) - muy2
+        sigmaxy = F.conv2d(x * y, self.g_masks, groups=3, padding=self.pad) - muxy
+
+        # l(j), cs(j) in MS-SSIM
+        l  = (2 * muxy    + self.C1) / (mux2    + muy2    + self.C1)  # [B, 15, H, W]
+        cs = (2 * sigmaxy + self.C2) / (sigmax2 + sigmay2 + self.C2)
+
+        lM = l[:, -1, :, :] * l[:, -2, :, :] * l[:, -3, :, :]
+        PIcs = cs.prod(dim=1)
+
+        loss_ms_ssim = 1 - lM*PIcs  # [B, H, W]
+
+        loss_l1 = F.l1_loss(x, y, reduction='none')  # [B, 3, H, W]
+        # average l1 loss in 3 channels
+        gaussian_l1 = F.conv2d(loss_l1, self.g_masks.narrow(dim=0, start=-3, length=3),
+                               groups=3, padding=self.pad).mean(1)  # [B, H, W]
+
+        loss_mix = self.alpha * loss_ms_ssim + (1 - self.alpha) * gaussian_l1 / self.DR
+        loss_mix = self.compensation*loss_mix
+
+        return loss_mix.mean()
     
-def imshow(img):
-    img = img / 2 + 0.5
-    npimg = img.numpy()
-    plt.imshow(np.transpose(npimg, (1, 2, 0)))
-    plt.show()
-
-def psnr(img1, img2):
-    mse = np.mean( (img1 - img2) ** 2 )
-    if mse == 0:
-      return 100
-    IXEL_MAX = 255.0
-    return 20 * math.log10(PIXEL_MAX / math.sqrt(mse))
-
-def train_model(train_dl, model):
-    counter = 0
-    model.train()
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.0002)
-    for epoch in range(80):
-        running_loss = 0.0
-        for data in train_dl:
-            inputs, labels = data
-            temp = tensorStack(inputs)
-            inputs, temp = inputs.cuda(), temp.cuda()
-            optimizer.zero_grad()
-            outputs = model(temp)
-            loss = criterion(outputs, inputs)
-            loss.backward()
-            optimizer.step()
-            running_loss += loss.item()
-        counter += 1
-        if (counter % 10 == 0):
-            print(running_loss, 'Epochs = ', counter)
-            
 # ------------------ #
 #        SSIM
 # ------------------ #
@@ -145,13 +170,96 @@ def ssim(img1, img2, window_size = 11, size_average = True):
     window = window.type_as(img1)
     
     return _ssim(img1, img2, window, window_size, channel, size_average)
-  
+
+def rgb2bayer(img):
+    temp = img.numpy()
+    temp = temp.transpose(1,2,0)
+
+    w,h,c = temp.shape
+    resArray = np.zeros((w, h, 3), dtype=np.float)
+    resArray[::2, ::2, 2] = temp[::2, ::2, 2]
+    resArray[1::2, ::2, 1] = temp[1::2, ::2, 1]
+    resArray[::2, 1::2, 1] = temp[::2, 1::2, 1]
+    resArray[1::2, 1::2, 0] = temp[1::2, 1::2, 0]
+    resArray = resArray.astype('float32')
+
+    temp = torch.from_numpy(resArray)
+    temp = temp.permute(2,0,1)
+    return temp
+
+def tensorStack(tenS):
+    temp = []
+    for i in tenS:
+        i = rgb2bayer(i)
+        temp.append(i)
+    temp = torch.stack(temp)
+    return temp
+    
+def imshow(img):
+    img = img / 2 + 0.5
+    npimg = img.numpy()
+    plt.imshow(np.transpose(npimg, (1, 2, 0)))
+    plt.show()
+
+def psnr(img1, img2):
+    mse = np.mean( (img1 - img2) ** 2 )
+    if mse == 0:
+      return 100
+    IXEL_MAX = 255.0
+    return 20 * math.log10(PIXEL_MAX / math.sqrt(mse))
+
+def train_model(train_dl, model, method, epochs):
+    model.train()
+    optimizer = optim.Adam(model.parameters(), lr=0.0002)
+
+    if method == 'MSSSIM':
+        criterion = MS_SSIM_L1_LOSS()
+        for epoch in range(60):
+            for data in train_dl:
+                inputs, labels = data
+                temp = tensorStack(inputs)
+                inputs, temp = inputs.cuda(), temp.cuda()
+                optimizer.zero_grad()
+                outputs = model(temp)
+                loss = criterion(inputs, outputs)
+                loss.backward()
+                optimizer.step()
+            if ((epoch+1) % 10 == 0):
+                print(loss, epoch)
+
+    elif method == 'MSE':
+        criterion = nn.MSELoss()
+        for epoch in range(60):
+            running_loss = 0.0
+            for data in train_dl:
+                inputs, labels = data
+                temp = tensorStack(inputs)
+                inputs, temp = inputs.cuda(), temp.cuda()
+                optimizer.zero_grad()
+                outputs = model(temp)
+                loss = criterion(outputs, inputs)
+                loss.backward()
+                optimizer.step()
+                running_loss += loss.item()
+            if ((epoch+1) % 10 == 0):
+                print(running_loss, 'Epochs = ', epoch)
+
+    else:
+        print('Non-valid loss method \n')
+        return 0
+            
 preprocess = transforms.Compose([
-    transforms.Resize(256),
-    transforms.CenterCrop(224),
+    transforms.Resize((224,224)),
+    #transforms.CenterCrop(224),
     transforms.ToTensor(),
-    #transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    #transforms.Normalize(mean=[0.5], std=[0.5]),
+])
+
+BSDpreprocess = transforms.Compose([
+    transforms.Resize((224,224)),
+    #transforms.CenterCrop(224),
+    transforms.RandomRotation(degrees=15),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
 ])
 
 class ConvBlock(nn.Module):
@@ -180,12 +288,14 @@ class OutBlock(nn.Module):
         self.conv = nn.Conv2d(in_channels, out_channels, padding=padding, kernel_size=kernel_size, stride=stride)
         self.conv32 = nn.Conv2d(32, out_channels, padding=padding, kernel_size=kernel_size, stride=stride)
         self.outConv = nn.Conv2d(32, 3, padding=padding, kernel_size=3, stride=stride)
+        self.dropout = nn.Dropout(0.4)
         self.relu = nn.ReLU()
         self.with_nonlinearity = with_nonlinearity
 
     def forward(self, x):
         x = self.conv(x)
         x = self.conv32(x)
+        x = self.dropout(x)
         x = self.outConv(x)
         if self.with_nonlinearity:
             x = self.relu(x)
@@ -300,30 +410,45 @@ class UNetWithResnet50Encoder(nn.Module):
 # ------------------ #
 batchSize = 32
 model = UNetWithResnet50Encoder().cuda()
+method = 'MSE'
 
-trainpath = 'drive/MyDrive/Colab Notebooks/TrainingData/FiveK'
+trainpath = 'drive/MyDrive/5th Yr Project/TrainingData/FiveK'
 trainset = datasets.ImageFolder(root=trainpath,transform=preprocess)
 trainloader = DataLoader(dataset=trainset,batch_size=batchSize, shuffle=True)
 t0 = time.time()
 print('Training with FiveK dataset')
-train_model(trainloader,model)
-
+train_model(trainloader,model,method)
 print('Training time for FiveK')
 print('{} seconds'.format(time.time() - t0))
 
-trainpath = 'drive/MyDrive/Colab Notebooks/TrainingData/DTD'
+trainpath = 'drive/MyDrive/5th Yr Project/TrainingData/BSD300'
+trainset = datasets.ImageFolder(root=trainpath,transform=preprocess)
+trainloader = DataLoader(dataset=trainset,batch_size=batchSize, shuffle=True)
+print('Training with BSD300')
+train_model(trainloader,model,method)
+print('Training time for BSD300')
+print('{} seconds'.format(time.time() - t0))
+
+trainpath = 'drive/MyDrive/5th Yr Project/TrainingData/BSD300'
+trainset = datasets.ImageFolder(root=trainpath,transform=BSDpreprocess)
+trainloader = DataLoader(dataset=trainset,batch_size=batchSize, shuffle=True)
+print('Training with BSD300 Augments')
+train_model(trainloader,model,method)
+print('Training time for BSD300 Augments')
+print('{} seconds'.format(time.time() - t0))
+
+trainpath = 'drive/MyDrive/5th Yr Project/TrainingData/DTD'
 trainset = datasets.ImageFolder(root=trainpath,transform=preprocess)
 trainloader = DataLoader(dataset=trainset,batch_size=batchSize, shuffle=True)
 print('Training with DTD')
-train_model(trainloader,model)
-
+train_model(trainloader,model,method)
 print('Training time total')
 print('{} seconds'.format(time.time() - t0))
 
 # ------------------ #
 #   Testing Kodak
 # ------------------ #
-testpath = 'drive/MyDrive/Colab Notebooks/Kodak'
+testpath = 'drive/MyDrive/5th Yr Project/TestData/Kodak'
 testset = datasets.ImageFolder(root=testpath,transform=preprocess)
 testloader = DataLoader(dataset=testset,batch_size=24, shuffle=False)
 model.eval()
