@@ -208,7 +208,7 @@ def psnr(img1, img2):
     IXEL_MAX = 255.0
     return 20 * math.log10(PIXEL_MAX / math.sqrt(mse))
 
-def train_model(train_dl, model, method, epochs):
+def train_model(train_dl, model, method):
     model.train()
     optimizer = optim.Adam(model.parameters(), lr=0.0002)
 
